@@ -1,0 +1,397 @@
+---
+title: "Undergraduate Vacancy Rate"
+author: "Vinicius Hiago e Silva Geronimo"
+date: "today"
+format:
+  html:
+    mainfont: Playfair Display
+    sansfont: Playfair Display
+    highlight: tango        # Estilo de cor para o código
+    toc: true               # Tabela de Conteúdo (Sumário)
+    toc-location: left      # Posição do Sumário
+    toc-float: true         # Faz o Sumário "flutuar"
+    code-fold: true         # A MÁGICA: Habilita o botão para esconder/mostrar código
+    code-summary: "Show Code"
+---
+
+```{r}
+#| echo: false
+#| warning: false
+#| include: false
+#| message: false
+
+
+packages = c("dplyr", "ggplot2", "basedosdados", "sf", "geobr", "stringr",
+             "tidyverse", "data.table", "mirt", "readxl",
+             "showtext", "scales", "knitr", "stringi")
+
+for (pck in packages) {
+  if (!requireNamespace(pck, quietly = TRUE)) {
+    install.packages(pck)
+  }
+}
+lapply(packages, library, character.only = TRUE)
+
+# Load font for plotting
+font_add_google(name = 'Playfair Display', family = 'pf')
+showtext_auto()
+```
+
+## Higher Education Data
+
+Brazilian higher education data at the course level was obtained from the 2023 Higher Education Census, from INEP, via the Base dos Dados organization's datalake. The analysis focuses only on public institutions and undergraduate courses.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: show
+
+# Set the billing ID
+basedosdados::set_billing_id('vinicius-projetos-r')
+
+# Query to download dictionary
+dic_query = "SELECT * FROM `basedosdados.br_inep_censo_educacao_superior.dicionario`"
+
+census_dic = basedosdados::read_sql(dic_query)
+
+
+# Query to download higher education data
+census_query = paste("
+SELECT 
+  sigla_uf, id_municipio, tipo_grau_academico, tipo_organizacao_administrativa,      nome_area_detalhada, nome_area_geral, quantidade_vagas, quantidade_ingressantes
+FROM 
+  `basedosdados.br_inep_censo_educacao_superior.curso`
+WHERE 
+  ano = 2023 AND tipo_nivel_academico = '1' AND rede = '1' AND sigla_uf IS NOT NULL   AND nome_area_detalhada IS NOT NULL
+", sep="")
+
+census_base = as.data.frame(basedosdados::read_sql(
+    query = gsub("\\s+", " ", census_query)))
+
+for (col in c(7:8)){
+  census_base[,col] = as.numeric(census_base[,col])
+}
+```
+
+## Data Processing and Geolocation
+
+The vacancy rate was calculated by **(number of vacancies - number of admitted students) / number of vacancies**.
+
+The first processing step was to define the maximum number of admitted students in a course at an institution as the total number of vacancies for that course. This is necessary because it is common to have courses with a higher number of admitted students than the total number of vacancies offered in the database, perhaps due to filling errors by institutions caused by confusion in adopted concepts, which would hinder our analysis.
+
+The second processing step was to remove the 'Federal Institute of Education, Science and Technology of Mato Grosso' from our database, as it represented an outlier in the data.
+
+To locate the mesoregion where the institution is installed, a spreadsheet from the NEREUS group was used to match municipalities with mesoregions. The boundaries of Brazilian mesoregions were obtained through the `geobr` package.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: show
+
+# Normalize columns
+norm_categoria = census_dic %>%
+  filter(nome_coluna == 'tipo_categoria_administrativa') %>%
+  select(chave, valor) %>%
+  deframe()
+
+norm_grau = census_dic %>%
+  filter(nome_coluna == 'tipo_grau_academico') %>%
+  select(chave, valor) %>%
+  deframe()
+
+census_base = census_base %>%
+  mutate(tipo_grau_academico = recode(tipo_grau_academico, !!!norm_grau),
+         tipo_organizacao_administrativa = recode(tipo_organizacao_administrativa, !!!norm_categoria))
+
+
+# Define the maximum number of admitted students
+census_base = census_base %>%
+  mutate(qtd_vagas_tratada = ifelse(quantidade_vagas == 0, NA, quantidade_vagas),
+         qtd_ingressos_tratado = ifelse(quantidade_ingressantes > qtd_vagas_tratada, qtd_vagas_tratada, quantidade_ingressantes))
+
+# Remove institution
+census_base = census_base %>%
+  filter(qtd_vagas_tratada < 1000 | qtd_vagas_tratada == 1126)
+```
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: show
+
+# Get mesoregions's boundaries 
+meso_boundary = read_meso_region(year=2020) %>%
+  select(name_meso, geom) %>%
+  mutate(name_meso = str_to_lower(stri_trans_general(name_meso, "latin-ascii")))
+
+# Get match between municipatilies and mesoregions
+join = read_xlsx('regioes_geo.xlsx') %>%
+  select(8,12) %>%
+  rename(codigo = `Código Município Completo`,
+         meso = `Nome_Mesorregião`) %>%
+  mutate(meso = str_to_lower(stri_trans_general(meso, "latin-ascii")))
+
+# Join tables
+final_base = left_join(census_base, join, by = c('id_municipio' = 'codigo'))
+final_base = left_join(final_base, meso_boundary, by = c('meso'='name_meso')) %>% st_as_sf()
+```
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+# Create table grouping by mesoregions
+t = final_base %>%
+  group_by(meso) %>%
+  summarise(ingressos = sum(qtd_ingressos_tratado),
+            vagas = sum(qtd_vagas_tratada)) %>%
+  mutate(taxa = (vagas - ingressos) / vagas)
+```
+
+## Graphs
+
+From the map below, it is possible to perceive that the undergraduate vacancy rate has a spatial heterogeneity. More specifically, the North and Northeast regions show a higher occupation of offered vacancies, while the Center-South of Brazil presents a higher vacancy rate, with the exception of São Paulo and Paraná, where they apparently also show low vacancy rates.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| fig.width: 16
+#| fig.height: 14
+
+
+max_val <- max(t$taxa, na.rm = TRUE)
+min_val <- min(t$taxa, na.rm = TRUE)
+
+ggplot() +
+  geom_sf(data = meso_boundary, fill = 'grey80', color = "white", linewidth = 0.5) +
+  geom_sf(data = t, aes(fill=taxa), color = "white", linewidth = 0.2) +
+  scale_fill_distiller(
+    name = "",
+    palette = "RdBu",
+    direction = -1,
+    na.value = "grey",
+    labels = percent,
+    limits = c(min_val, max_val),
+    breaks = c(min_val, max_val)) +
+  labs(
+    title = "Undergraduate Vacancy Rate",
+    subtitle = "Distribution across mesoregions",
+    caption = "Fonte: Censo da Educação Superior 2023; Base dos Dados."
+  ) +
+  theme_void() +
+  theme(
+    plot.title = element_text(family = "pf", size = 100, face = "bold", color = "#222222", hjust = 0.5),
+    plot.subtitle = element_text(family = "pf", size = 50, color = "#555555", hjust = 0.5),
+    legend.text = element_text(family = "pf", size = 45),
+    plot.caption = element_text(family = "pf", size = 40, hjust = 0.5),
+    legend.position = 'bottom',
+    legend.key.width = unit(1.8, "cm"),
+    legend.key.size= unit(0.7, "cm")
+  )
+```
+
+Seeking to deepen the work, a study was conducted on which bachelor's and licentiate degree courses presented the highest and lowest vacancy rates in Brazil. Courses with few classes and vacancies offered in Brazil were disregarded, such as, for example, Education Science, limiting the analysis to larger courses. A greater presence of Data and Software courses is observed among those with lower vacancy rates, and Engineering courses among those with higher vacancy rates.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+ordered_data <- as.data.frame(final_base) %>%
+  filter(!is.na(nome_area_detalhada),
+         tipo_grau_academico %in% c('Bacharelado', 'Licenciatura'),
+         !nome_area_detalhada %in% c('Medicina e terapia tradicional e complementar',
+                                     'Finanças, bancos e seguros', 
+                                     'Ciência da educação',
+                                     'Têxteis (vestuário, calçados e couro)',
+                                     'Programas interdisciplinares abrangendo engenharia, produção e construção',
+                                     'Formação de professores de educação infantil',
+                                     'Programas interdisciplinares abrangendo ciências sociais, comunicação e informação',
+                                     'Veículos a motor, construção naval, aeronáutica, ferroviária e metroviária')) %>%
+  group_by(nome_area_detalhada) %>%
+  summarise(vagas = sum(qtd_vagas_tratada, na.rm = TRUE),
+            ingressos = sum(qtd_ingressos_tratado, na.rm = TRUE),
+            taxa = (vagas - ingressos)/vagas,
+            .groups = 'drop') %>%
+  mutate(taxa_z = round((taxa - mean(taxa, na.rm = TRUE)) / sd(taxa, na.rm = TRUE),2)) %>%
+  arrange(desc(taxa_z))
+
+
+bottom_10 <- tail(ordered_data, 10)
+
+top_10 <- head(ordered_data, 10)
+
+
+top_bottom_20 <- bind_rows(top_10, bottom_10) %>%
+  mutate(nome_area_detalhada = factor(nome_area_detalhada, levels = ordered_data$nome_area_detalhada)) %>%
+  mutate(
+    nome_area_curto = recode(nome_area_detalhada,
+                             "Programas interdisciplinares abrangendo computação e Tecnologias da Informação e Comunicação (TIC)" = 'Desenvolvimento de Softw.',
+                             "Soluções computacionais para domínios específicos"  = "Ciência de dados",
+                             "Setor militar e de defesa" = "Ciências militares",
+                             "Medicina" = "Medicina",
+                             "Odontologia" = "Odontologia",
+                             "Veterinária" = "Veterinária",
+                             "Ciência da computação" = "Ciência da computação",
+                             "Programas interdisciplinares abrangendo educação" = "Interdisciplina em educação",
+                             "Silvicultura" = "Engenharia florestal",
+                             "Física" = "Física",
+                             "Matemática" = "Matemática",
+                             "Programas interdisciplinares abrangendo artes e humanidades" = "Interdisciplina em humanidades",
+                             "Processamento de alimentos" = "Engenharia de alimentos",
+                             "Materiais" = "Engenharia de materiais",
+                             "Pesca" = "Engenharia de pesca",
+                             "Serviços de alimentação" = "Gastronomia",
+                             "Produção de software" = "Engenharia de Softw.",
+                             "Mineração e extração" = "Eng. de Minas e Petróleo"))
+```
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| fig.width: 9
+#| fig.height: 6
+
+ggplot(top_bottom_20, aes(x=nome_area_curto, y=taxa_z, label=taxa_z)) + 
+  geom_point(stat='identity', fill="#26735B", size=6)  +
+  geom_segment(aes(y = 0, 
+                   x = nome_area_curto, 
+                   yend = taxa_z, 
+                   xend = nome_area_curto), 
+               color = "#0D261E") +
+  labs(title="Undergraduate Normalized Vacancy Rate", 
+       subtitle="10 Lowest and Highest rates for bachelor's and licentiate degrees",
+       x='',
+       y='',
+       caption = "Fonte: Censo da Educação Superior 2023; Base dos Dados."
+  ) + 
+  ylim(-2.5, 2.5) +
+  coord_flip() +
+  theme(
+     panel.background = element_rect(fill = "white", colour = NA), 
+    plot.background = element_rect(fill = "white", colour = NA),  
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), 
+
+    text = element_text(family = "pf"),
+    plot.title = element_text(size = 40, face = "bold", color = "#222222", hjust = 0.5),
+    plot.margin = margin(r = 2, l = 2, unit = "cm"),
+    plot.subtitle = element_text( size = 25, color = "#555555", hjust = 0.5),
+    plot.caption = element_text(size = 20, hjust = 0.5),
+    legend.position = 'none',
+    axis.text.x = element_text(size = 25),
+    axis.text.y = element_text(size = 20))
+```
+
+Finally, seeking to expand the analysis, a visualization was developed to better understand the misalignment between offered courses and regional demands.
+
+In the graph below, it is noticeable that ICT, Health, and Business & Law courses have a high occupancy rate in practically all states. Courses classified as Exact Sciences, Education, and Agro & Veterinary are those with lower occupancy rates in several states.
+
+The states with a higher predominance of green dots are São Paulo, Paraná, and Pará, while those with more red dots are Goiás, Rio Grande do Norte, and Santa Catarina. While Exact Sciences courses have high occupancy in the Northeast region, there is not as much demand in the rest of Brazil. The North region, in turn, shows more occupancy in engineering courses than the rest of Brazil. In the Northeast, although Law and Business courses have a medium-high occupancy, they have lower levels compared to the rest of Brazil. In the Center-West, there is greater heterogeneity than in other regions regarding course occupancy.
+
+#### This analysis is useful for contributing to the discussion of reviewing the distribution and relevance of courses offered in Brazil.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+# Griup by major area and state
+regional_data <- as.data.frame(final_base) %>%
+  filter(!is.na(nome_area_geral)) %>%
+  group_by(nome_area_geral, sigla_uf) %>%
+  summarise(vagas = sum(qtd_vagas_tratada, na.rm = TRUE),
+            ingressos = sum(qtd_ingressos_tratado, na.rm = TRUE),
+            taxa = (vagas - ingressos)/vagas)
+
+# Get the unique values
+unicos = unique(regional_data$nome_area_geral)
+
+# Rename major areas
+regional_data = regional_data %>%
+  mutate(nome_curto = 
+    case_when(
+      nome_area_geral == 'Agricultura, silvicultura, pesca e veterinária' ~ 'Agro e Veterinária',
+      nome_area_geral == 'Ciências naturais, matemática e estatística'~'Ciências exatas',
+      nome_area_geral == 'Ciências sociais, comunicação e informação'~'Sociais e comunicação',
+      nome_area_geral == 'Computação e Tecnologias da Informação e Comunicação (TIC)'~'TIC',
+      nome_area_geral == 'Engenharia, produção e construção'~'Engenharias',
+      nome_area_geral == 'Negócios, administração e direito'~'Negócios e Direito',
+      nome_area_geral == 'Saúde e bem-estar'~'Saúde',
+      nome_area_geral == 'Artes e humanidades'~'Artes e humanidades',
+      nome_area_geral == 'Educação'~'Educação',
+      nome_area_geral == 'Serviços'~'Serviços',
+      nome_area_geral == 'Programas básicos'~'Programas básicos'
+    )
+  )
+```
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+# Create table to get regions
+dados_estados <- data.frame(
+  sigla_uf = c("AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA",
+                   "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN",
+                   "RO", "RR", "RS", "SC", "SE", "SP", "TO"),
+  regiao = c("Norte", "Nordeste", "Norte", "Norte", "Nordeste", "Nordeste", "Centro-Oeste", "Sudeste", "Centro-Oeste", "Nordeste",
+             "Sudeste", "Centro-Oeste", "Centro-Oeste", "Norte", "Nordeste", "Nordeste", "Nordeste", "Sul", "Sudeste", "Nordeste",
+             "Norte", "Norte", "Sul", "Sul", "Nordeste", "Sudeste", "Norte")
+)
+
+
+ordem_regioes <- c("Norte", "Nordeste", "Sudeste", "Sul", "Centro-Oeste")
+
+# Sort states
+dados_ordenados <- dados_estados %>%
+  mutate(regiao = factor(regiao, levels = ordem_regioes)) %>%
+  arrange(regiao, sigla_uf) %>%
+  mutate(sigla_uf = factor(sigla_uf, levels = unique(sigla_uf)))
+
+regional_data = left_join(regional_data,
+                          dados_ordenados) %>%
+  arrange(regiao) %>%
+  mutate(sigla_uf = fct_inorder(sigla_uf))
+```
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| fig.width: 8
+#| fig.height: 8
+
+ggplot(regional_data, aes(nome_curto, sigla_uf, color = taxa)) +
+  geom_point(size = 6) +
+  scale_color_gradient2(
+    low = "darkgreen",    
+    mid = "lightgrey",  
+    high = "darkred",    
+    midpoint = 0.5)+ labs(title="Undergraduate Vacancy Rate", 
+       subtitle="Rate by major area across states",
+       x='',
+       y='',
+       caption = "Fonte: Censo da Educação Superior 2023; Base dos Dados."
+  ) +
+  coord_flip() +
+  theme(
+     panel.background = element_rect(fill = "white", colour = NA),
+    plot.background = element_rect(fill = "white", colour = NA), 
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(), 
+    text = element_text(family = "pf"),
+    plot.title = element_text(size = 40, face = "bold", color = "#222222", hjust = 0.5),
+    plot.subtitle = element_text( size = 25, color = "#555555", hjust = 0.5),
+    plot.caption = element_text(size = 20, hjust = 0.5),
+    legend.position = 'none',
+    axis.text.x = element_text(size = 16),
+    axis.text.y = element_text(size = 20))
+```
